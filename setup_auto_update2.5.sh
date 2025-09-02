@@ -1,0 +1,296 @@
+#!/bin/bash
+
+# 检查是否以root权限运行
+if [ "$(id -u)" -ne 0 ]; then
+    echo "错误：此脚本需要root权限运行，请使用sudo或切换到root用户" >&2
+    exit 1
+fi
+
+# 检测并安装所需依赖
+echo "正在检测并安装所需依赖..."
+
+# 检测包管理器类型
+if command -v apt &> /dev/null; then
+    PACKAGE_MANAGER="apt"
+    UPDATE_CMD="apt update -y"
+    INSTALL_CMD="apt install -y"
+elif command -v yum &> /dev/null; then
+    PACKAGE_MANAGER="yum"
+    UPDATE_CMD="yum check-update"
+    INSTALL_CMD="yum install -y"
+else
+    echo "错误：不支持的Linux发行版，未检测到apt或yum包管理器" >&2
+    exit 1
+fi
+
+# 检测并安装gpg
+if ! command -v gpg &> /dev/null; then
+    echo "未找到gpg，正在安装..."
+    if [ "$PACKAGE_MANAGER" = "apt" ]; then
+        if ! $UPDATE_CMD; then
+            echo "错误：执行apt更新失败，无法安装gnupg" >&2
+            exit 1
+        fi
+        if ! $INSTALL_CMD gnupg; then
+            echo "错误：使用apt安装gnupg失败，请检查网络或软件源" >&2
+            exit 1
+        fi
+    else
+        if ! $INSTALL_CMD gnupg2; then
+            echo "错误：使用yum安装gnupg2失败，请检查网络或软件源" >&2
+            exit 1
+        fi
+    fi
+else
+    echo "gpg已安装"
+fi
+
+# 检测并安装openssl
+if ! command -v openssl &> /dev/null; then
+    echo "未找到openssl，正在安装..."
+    if ! $UPDATE_CMD; then
+        echo "错误：执行包管理器更新失败，无法安装openssl" >&2
+        exit 1
+    fi
+    if ! $INSTALL_CMD openssl; then
+        echo "错误：使用$PACKAGE_MANAGER安装openssl失败，请检查网络或软件源" >&2
+        exit 1
+    fi
+else
+    echo "openssl已安装"
+fi
+
+# 检测并安装swaks
+if ! command -v swaks &> /dev/null; then
+    echo "未找到swaks，正在安装..."
+    if [ "$PACKAGE_MANAGER" = "apt" ]; then
+        if ! $UPDATE_CMD; then
+            echo "错误：执行apt更新失败，无法安装swaks" >&2
+            exit 1
+        fi
+        if ! $INSTALL_CMD swaks; then
+            echo "错误：使用apt安装swaks失败，请检查网络或软件源" >&2
+            exit 1
+        fi
+    else
+        if ! $INSTALL_CMD swaks; then
+            echo "错误：使用yum安装swaks失败，请检查网络或软件源" >&2
+            exit 1
+        fi
+    fi
+else
+    echo "swaks已安装"
+fi
+
+# 提示用户输入邮箱配置信息
+read -p "请输入发件人邮箱地址: " SENDER
+read -p "请输入发件人邮箱授权码: " PASSWORD
+read -p "请输入SMTP服务器(如smtp.qq.com): " SMTP_SERVER
+read -p "请输入SMTP端口(通常是587): " SMTP_PORT
+read -p "请输入接收密码的邮箱地址（需与GPG密钥邮箱一致）: " USER_EMAIL
+
+# 验证邮箱格式（简单验证）
+if ! echo "$USER_EMAIL" | grep -qE '^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$'; then
+    echo "错误：邮箱格式不正确，正确格式应为user@domain.com" >&2
+    exit 1
+fi
+
+# 提示用户选择GPG公钥导入方式
+echo "请选择GPG公钥导入方式："
+echo "1. 手动输入公钥内容"
+echo "2. 通过文件上传公钥"
+read -p "请输入选项(1/2): " GPG_IMPORT_METHOD
+
+# 验证用户选择
+if [ "$GPG_IMPORT_METHOD" != "1" ] && [ "$GPG_IMPORT_METHOD" != "2" ]; then
+    echo "错误：无效的选项，请输入1或2" >&2
+    exit 1
+fi
+
+# 根据选择导入GPG公钥
+if [ "$GPG_IMPORT_METHOD" = "1" ]; then
+    echo "请输入GPG公钥（输入完毕后按Ctrl+D结束）:"
+    if ! gpg --import - 2>&1; then
+        echo "错误：GPG公钥导入失败，可能是公钥格式错误或不完整" >&2
+        exit 1
+    fi
+else
+    read -p "请输入GPG公钥文件的绝对路径: " GPG_FILE_PATH
+    # 检查文件是否存在
+    if [ ! -f "$GPG_FILE_PATH" ]; then
+        echo "错误：文件不存在，请检查路径是否正确" >&2
+        exit 1
+    fi
+    # 检查文件是否可读
+    if [ ! -r "$GPG_FILE_PATH" ]; then
+        echo "错误：没有文件读取权限，请检查文件权限设置" >&2
+        exit 1
+    fi
+    # 导入公钥文件
+    echo "正在从文件导入GPG公钥..."
+    if ! gpg --import "$GPG_FILE_PATH" 2>&1; then
+        echo "错误：从文件导入GPG公钥失败，可能是文件格式错误" >&2
+        exit 1
+    fi
+fi
+
+# 配置GPG密钥信任级别
+echo "正在配置GPG密钥信任级别..."
+
+# 获取导入的公钥指纹
+KEY_FINGERPRINT=$(gpg --list-keys --with-fingerprint --with-colons "$USER_EMAIL" | grep 'fpr:' | cut -d: -f10 | head -n1)
+
+if [ -z "$KEY_FINGERPRINT" ]; then
+    echo "错误：未找到与邮箱$USER_EMAIL关联的GPG密钥，请检查公钥是否正确导入" >&2
+    exit 1
+fi
+
+echo "找到密钥指纹: ${KEY_FINGERPRINT:0:8}..."
+
+# 显示信任级别说明
+echo "请设置GPG密钥的信任级别："
+echo "1 = 未知 (unknown)"
+echo "2 = 从不 (never)"
+echo "3 = 边缘 (marginal) - 通常用于新密钥"
+echo "4 = 完全 (full) - 用于你信任的密钥"
+echo "5 = 终极 (ultimate) - 用于你自己控制的密钥"
+read -p "请输入信任级别(1-5): " TRUST_LEVEL
+
+# 验证信任级别输入
+if ! [[ "$TRUST_LEVEL" =~ ^[1-5]$ ]]; then
+    echo "错误：无效的信任级别，请输入1-5之间的数字" >&2
+    exit 1
+fi
+
+# 设置密钥信任级别
+if ! echo -e "trust\n$TRUST_LEVEL\ny\nquit" | gpg --batch --command-fd 0 --edit-key "$KEY_FINGERPRINT"; then
+    echo "错误：设置GPG密钥信任级别失败" >&2
+    exit 1
+fi
+
+echo "GPG密钥信任级别已成功设置为$TRUST_LEVEL级"
+
+# 生成目标脚本 auto_update_root_pass.sh
+SCRIPT_PATH="/usr/local/bin/auto_update_root_pass.sh"
+if ! cat > "$SCRIPT_PATH" << EOF
+#!/bin/bash
+
+# 确保以root权限运行
+if [ "\$(id -u)" -ne 0 ]; then
+    echo "错误：此脚本需要root权限运行" >&2
+    exit 1
+fi
+
+# 配置参数
+SMTP_SERVER="$SMTP_SERVER"
+SMTP_PORT="$SMTP_PORT"
+SENDER="$SENDER"
+PASSWORD="$PASSWORD"
+RECEIVER="$USER_EMAIL"  # 接收邮箱（需与GPG密钥邮箱一致）
+LOG_FILE="/var/log/root_password_changes.log"
+GPG_RECIPIENT="$USER_EMAIL"  # GPG接收者
+
+# 生成16位随机密码
+NEW_PASSWORD=\$(openssl rand -base64 16 | tr -d '/+' | cut -c1-16)
+if [ -z "\$NEW_PASSWORD" ]; then
+    echo "\$(date "+%Y-%m-%d %H:%M:%S") - 错误：生成随机密码失败，openssl命令执行异常" >> \$LOG_FILE
+    exit 1
+fi
+
+# 尝试更新root密码
+if echo "root:\$NEW_PASSWORD" | /usr/sbin/chpasswd; then
+    # 记录日志（不记录明文密码）
+    echo "\$(date "+%Y-%m-%d %H:%M:%S") - Root password changed successfully on \$(hostname)" >> \$LOG_FILE
+    
+    # 使用GPG加密密码（仅接收者可解密）
+    ENCRYPTED_PASS=\$(echo "\$NEW_PASSWORD" | gpg -a -e -r "\$GPG_RECIPIENT" 2>&1)
+    if [ -z "\$ENCRYPTED_PASS" ] || echo "\$ENCRYPTED_PASS" | grep -q "error"; then
+        echo "\$(date "+%Y-%m-%d %H:%M:%S") - 错误：密码加密失败，GPG错误信息：\$ENCRYPTED_PASS" >> \$LOG_FILE
+        exit 1
+    fi
+    
+    # 发送加密后的邮件
+    SUBJECT="Encrypted Root Password Updated - \$(hostname) - \$(date "+%Y-%m-%d")"
+    BODY="The root password on \$(hostname) has been automatically updated.
+    
+    Encrypted new password (use your GPG private key to decrypt):
+    ---------------------------------------------------------
+    \$ENCRYPTED_PASS
+    ---------------------------------------------------------
+    
+    Update time: \$(date "+%Y-%m-%d %H:%M:%S")
+    Server: \$(hostname) (\$(hostname -I | awk '{print \$1}'))
+    
+    To decrypt: save the encrypted text to a file, then run:
+    gpg --decrypt filename.txt"
+    
+    # 使用swaks发送邮件
+    if ! swaks --server \$SMTP_SERVER:\$SMTP_PORT \
+          --from \$SENDER \
+          --to \$RECEIVER \
+          --auth PLAIN \
+          --auth-user \$SENDER \
+          --auth-password \$PASSWORD \
+          --tls \
+          --header "Subject: \$SUBJECT" \
+          --body "\$BODY"; then
+        echo "\$(date "+%Y-%m-%d %H:%M:%S") - 错误：发送邮件失败，请检查swaks配置和邮件服务" >> \$LOG_FILE
+        exit 1
+    fi
+    
+    # 记录成功信息
+    echo "\$(date "+%Y-%m-%d %H:%M:%S") - Encrypted password sent to \$RECEIVER" >> \$LOG_FILE
+else
+    echo "\$(date "+%Y-%m-%d %H:%M:%S") - 错误：更新root密码失败，chpasswd命令执行异常" >> \$LOG_FILE
+    exit 1
+fi
+EOF
+then
+    echo "错误：生成目标脚本$SCRIPT_PATH失败，可能没有写入权限" >&2
+    exit 1
+fi
+
+# 设置脚本权限
+if ! chmod +x "$SCRIPT_PATH"; then
+    echo "错误：无法设置$SCRIPT_PATH的执行权限，请检查文件系统权限" >&2
+    exit 1
+fi
+
+# 配置crontab
+echo "现在配置crontab任务"
+
+# 提示用户输入cron时间表达式
+echo "请输入cron任务的执行时间表达式（格式: 分 时 日 月 周）"
+echo "例如: 0 3 1 * * 表示每月1日凌晨3点执行"
+read -p "请输入时间表达式: " CRON_TIME
+# 此版本为阿里云服务器版
+# 验证时间表达式格式（简单验证）
+if ! echo "$CRON_TIME" | grep -qE '^[0-9*/]+ [0-9*/]+ [0-9*/]+ [0-9*/]+ [0-9*/]+$'; then
+    echo "错误：时间表达式格式不正确，应为5个用空格分隔的字段（分 时 日 月 周）" >&2
+    exit 1
+fi
+
+# 备份当前crontab
+BACKUP_FILE="/tmp/crontab_backup_$(date +%s)"
+if ! crontab -l > "$BACKUP_FILE" 2>/dev/null; then
+    echo "警告：备份当前crontab失败，可能当前没有配置crontab任务" >&2
+fi
+
+# 添加新的任务到crontab
+if ! (
+    crontab -l 2>/dev/null | grep -v -E 'auto_update_root_pass.sh'  # 移除已有的相关配置
+    echo "$CRON_TIME /usr/local/bin/auto_update_root_pass.sh >> /var/log/auto_update_pass.log 2>&1"
+) | crontab -
+then
+    echo "错误：配置crontab任务失败，请检查cron服务状态或手动配置" >&2
+    exit 1
+fi
+
+# 确认操作完成
+echo "操作完成:"
+echo "1. 自动更新密码脚本已生成: $SCRIPT_PATH"
+echo "2. GPG公钥已导入并设置信任级别"
+echo "3. swaks已安装并配置用于邮件发送"
+echo "4. crontab执行时间: $CRON_TIME"
+echo "5. 脚本执行日志将保存到: /var/log/auto_update_pass.log"
+echo "6. 密码更新记录将保存到: /var/log/root_password_changes.log"
