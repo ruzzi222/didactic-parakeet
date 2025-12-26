@@ -1,0 +1,191 @@
+#!/bin/bash
+set -euo pipefail
+
+# 颜色定义（仅保留必要提示色）
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+RESET="\033[0m"
+
+# 检查root权限
+if [ "$(id -u)" -ne 0 ]; then
+    echo -e "${RED}错误：必须使用root权限运行（sudo ./disk_part.sh）${RESET}"
+    exit 1
+fi
+
+# 检查核心工具
+REQUIRED_TOOLS="fdisk partprobe mkswap mkfs.ext4 mkfs.xfs swapon df"
+for tool in $REQUIRED_TOOLS; do
+    if ! command -v $tool &> /dev/null; then
+        echo -e "${RED}错误：缺少工具 $tool，请提前安装${RESET}"
+        exit 1
+    fi
+done
+
+# 1. 选择目标磁盘
+echo -e "\n${YELLOW}===== 选择分区磁盘 =====${RESET}"
+echo "可用物理磁盘："
+lsblk -d -o NAME,SIZE,TYPE | grep -E '^sd|^vd|^nvme|^hd'
+echo -n -e "\n输入磁盘设备名（如 vdb、sda）："
+read DISK
+DISK_DEV="/dev/${DISK}"
+
+if [ ! -b "${DISK_DEV}" ]; then
+    echo -e "${RED}错误：磁盘 ${DISK_DEV} 不存在${RESET}"
+    exit 1
+fi
+
+# 危险警告（精简版）
+echo -e "\n${RED}警告：将清除 ${DISK_DEV} 所有数据！切勿选系统盘！${RESET}"
+echo -n "确认继续？(输入大写Y)："
+read CONFIRM
+if [ "${CONFIRM}" != "Y" ]; then
+    echo -e "${GREEN}操作已取消${RESET}"
+    exit 0
+fi
+
+# 2. 配置分区参数
+echo -e "\n${YELLOW}===== 配置分区 =====${RESET}"
+echo -n "输入分区数量（1-4）："
+read PART_COUNT
+if ! [[ "${PART_COUNT}" =~ ^[1-4]$ ]]; then
+    echo -e "${YELLOW}警告：默认创建1个分区${RESET}"
+    PART_COUNT=1
+fi
+
+# 初始化数组
+declare -a PART_SIZES=()
+declare -a PART_FS_TYPES=()
+declare -a PART_MOUNTS=()
+declare -a PART_CODES=()
+
+# 循环配置分区
+for ((i=0; i<PART_COUNT; i++)); do
+    PART_NUM=$((i+1))
+    echo -e "\n----- 分区 ${PART_NUM} -----"
+    
+    echo -n "输入大小（例+51200M，回车用剩余空间，最好是用M，大写）："
+    read SIZE
+    PART_SIZES[$i]="${SIZE:-}"
+    
+    echo -n "文件系统（1=swap/2=ext4/3=xfs，默认2）："
+    read FS_CHOICE
+    case "${FS_CHOICE}" in
+        1) PART_FS_TYPES[$i]="swap"; PART_CODES[$i]="82" ;;
+        2) PART_FS_TYPES[$i]="ext4"; PART_CODES[$i]="83" ;;
+        3) PART_FS_TYPES[$i]="xfs"; PART_CODES[$i]="bf01" ;;
+        *) PART_FS_TYPES[$i]="ext4"; PART_CODES[$i]="83" ;;
+    esac
+    
+    if [ "${PART_FS_TYPES[$i]}" != "swap" ]; then
+        echo -n "挂载点（例/data，默认/part${PART_NUM}）："
+        read MOUNT_POINT
+        if ! [[ "${MOUNT_POINT}" =~ ^/ ]]; then
+            MOUNT_POINT="/part${PART_NUM}"
+        fi
+        PART_MOUNTS[$i]="${MOUNT_POINT}"
+    else
+        PART_MOUNTS[$i]=""
+    fi
+done
+
+# 配置摘要
+echo -e "\n${YELLOW}===== 配置确认 =====${RESET}"
+echo "磁盘：${DISK_DEV}"
+for ((i=0; i<PART_COUNT; i++)); do
+    PART_NUM=$((i+1))
+    echo "分区${PART_NUM}：${DISK_DEV}${PART_NUM} | 大小：${PART_SIZES[$i]:-剩余空间} | 文件系统：${PART_FS_TYPES[$i]} | 挂载点：${PART_MOUNTS[$i]:-无}"
+done
+
+echo -n -e "\n${RED}执行全流程？(输入大写Y)：${RESET}"
+read FINAL_CONFIRM
+if [ "${FINAL_CONFIRM}" != "Y" ]; then
+    echo -e "${GREEN}操作已取消${RESET}"
+    exit 0
+fi
+
+# 3. 执行分区
+echo -e "\n${GREEN}===== 开始分区 =====${RESET}"
+fdisk "${DISK_DEV}" << EOF
+o
+w
+EOF
+sleep 2
+partprobe "${DISK_DEV}"
+
+for ((i=0; i<PART_COUNT; i++)); do
+    PART_NUM=$((i+1))
+    SIZE="${PART_SIZES[$i]}"
+    CODE="${PART_CODES[$i]}"
+    echo "创建分区${PART_NUM}..."
+    fdisk "${DISK_DEV}" << EOF
+n
+p
+${PART_NUM}
+
+${SIZE}
+t
+${PART_NUM}
+${CODE}
+w
+EOF
+    partprobe "${DISK_DEV}"
+    sleep 1
+done
+
+# 4. 格式化
+echo -e "\n${GREEN}===== 开始格式化 =====${RESET}"
+for ((i=0; i<PART_COUNT; i++)); do
+    PART_NUM=$((i+1))
+    PART_DEV="${DISK_DEV}${PART_NUM}"
+    FS_TYPE="${PART_FS_TYPES[$i]}"
+    echo "格式化 ${PART_DEV} (${FS_TYPE})..."
+    case "${FS_TYPE}" in
+        swap) mkswap -f "${PART_DEV}" ;;
+        ext4) mkfs.ext4 -F "${PART_DEV}" ;;
+        xfs) mkfs.xfs -f "${PART_DEV}" ;;
+    esac
+done
+
+# 5. 挂载
+echo -e "\n${GREEN}===== 开始挂载 =====${RESET}"
+for ((i=0; i<PART_COUNT; i++)); do
+    PART_NUM=$((i+1))
+    PART_DEV="${DISK_DEV}${PART_NUM}"
+    FS_TYPE="${PART_FS_TYPES[$i]}"
+    MOUNT_POINT="${PART_MOUNTS[$i]}"
+    
+    # 获取分区UUID
+    UUID=$(blkid -s UUID -o value "${PART_DEV}")
+    if [ -z "${UUID}" ]; then
+        echo -e "${RED}错误：无法获取 ${PART_DEV} 的UUID${RESET}"
+        exit 1
+    fi
+    
+    if [ "${FS_TYPE}" == "swap" ]; then
+        echo "启用swap ${PART_DEV} (UUID: ${UUID})"
+        swapon "${PART_DEV}"
+        # 写入fstab（swap使用UUID）
+        echo -e "UUID=${UUID}\tswap\tswap\tdefaults\t0 0" >> /etc/fstab
+    else
+        echo "挂载 ${PART_DEV} (UUID: ${UUID}) 到 ${MOUNT_POINT}"
+        mkdir -p "${MOUNT_POINT}"
+        mount "${PART_DEV}" "${MOUNT_POINT}"
+        case "${FS_TYPE}" in
+            ext4) FSTAB_OPTS="defaults,noatime,errors=remount-ro" ;;
+            xfs) FSTAB_OPTS="defaults,noatime" ;;
+        esac
+        # 写入fstab（文件系统使用UUID）
+        echo -e "UUID=${UUID}\t${MOUNT_POINT}\t${FS_TYPE}\t${FSTAB_OPTS}\t0 2" >> /etc/fstab
+    fi
+done
+
+echo -e "\n${GREEN}===== 操作完成！验证结果 =====${RESET}"
+echo -e "\n1. 分区表："
+fdisk -l "${DISK_DEV}" | grep -E "Device|${DISK_DEV}[1-4]"
+echo -e "\n2. 挂载状态："
+df -hT | grep -E "${DISK_DEV}|Filesystem"
+echo -e "\n3. fstab配置："
+tail -n ${PART_COUNT} /etc/fstab
+
+echo -e "\n${GREEN}操作完成，已经将uuid写入文件${RESET}"
